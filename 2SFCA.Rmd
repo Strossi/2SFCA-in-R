@@ -1,0 +1,715 @@
+---
+title: "2SFCA Lecture"
+author: "Ivor Mardesic"
+date: "12/10/2020"
+output: html_document
+---
+
+```{r Markdown setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+options(scipen = 999)
+rm(list=ls())
+#https://github.com/adam-p/markdown-here/wiki/Markdown-Cheatsheet
+```
+
+
+# Spatio-temporal accessibility analysis using the 2SFCA methodology - Ivor Mardesic
+
+In this Markdown document the 2SFCA methodology is implemented on the example of accessibility to hospitals for the citizens of the City of Zurich.
+
+
+## Prepare workspace
+We will use three R packages.
+
+[Sf](https://cran.r-project.org/web/packages/sf/sf.pdf) for managing spatial data.
+[tmap](https://cran.r-project.org/web/packages/tmap/tmap.pdf) for visualizations.
+[cppRouting](https://cran.r-project.org/web/packages/cppRouting/cppRouting.pdf) for calculating isochrones for points of interest.
+```{r R Packages}
+# Required packages
+# install.packages("sf")
+# install.packages("tmap")
+# install.packages("cppRouting")
+library(sf)
+library(tmap)
+library(cppRouting)
+library(sp)
+library(tidyverse)
+```
+
+## Import data
+
+[Zurich hospitals](https://www.stadt-zuerich.ch/geodaten/download/Spital?format=10007)
+
+[Road network](https://maps.zh.ch/)
+
+[Zurich Stadtkreise](https://www.stadt-zuerich.ch/geodaten/download/Stadtkreise?format=10007)
+
+Demographic data - GIUZ server
+```{r Data import, echo=F}
+# Zurich kreise shapefile
+kreis <- st_read(dsn = paste(getwd(), "/Data/kreise/data/stzh.adm_stadtkreise_a_polygon.shp", sep = "/"))
+zurich <- st_union(kreis) # Merge kreise to derive city of Zurich polygon
+
+
+# Zurich hospitals shapefile
+services <- st_read(dsn = "C:/Users/Ivor/Documents/R/Projects/2SFCA/Data/spital/data")
+services <- services[!duplicated(services$adresse),]
+services <- services[c("adresse", "geometry")]
+services$road_network_position <- services$geometry
+services$foot_network_position <- services$geometry
+
+# Swiss Bureau of Statistics 2013 Hectare population dataset
+demographic_data <- read.csv(file = paste(getwd(),  "/Data/MSc/volkszaehlung_2013_statpop/rawdata/gd-b-00.03-13-vz2013statpopb/STATPOP2013B.csv", sep = "/"))
+demographic_data <- demographic_data[, c("X_KOORD", "Y_KOORD", "B13BTOT", "RELI")] # subset useful things
+demographic_data <- st_as_sf(x = demographic_data, coords = c("X_KOORD", "Y_KOORD")) # spatial points
+st_crs(demographic_data) <- "EPSG:21781" # designate CRS
+demographic_data <- st_transform(x = demographic_data, crs = st_crs(zurich)) # equalize CRS between data
+names(demographic_data) <- c("poptotal", "PK", "geometry") # rename columns
+
+## Subset demographic data to only cover the City of Zurich
+population <- st_intersection(x = demographic_data, y = zurich) 
+population <- population[-4294,]
+population$road_network_position <- c(NA) # will be populated later
+population$foot_network_position <- c(NA) # will be populated later
+population$PK <- as.integer(1:nrow(population)) # our own PK list for the Zurich subset
+
+
+# Road road_network dataset
+road_network <- st_read(dsn = paste(getwd(), "/Data/MSc/Strassenentz/strasen/Strassennetz/TBA_STR_ACHS_L.shp", sep = "/"))
+road_network <- st_transform(x = road_network, crs = st_crs(zurich)) # set crs
+road_network <- road_network[, c("LENGTH", "geometry")] # subset usefull columns
+road_network$time_cost <- as.integer(0) # input needed for isochrones
+road_network$PK <- 1:nrow(road_network)
+
+# Foot road_network dataset
+foot_network <- st_read(dsn = paste(getwd(), "/Data/fussweg/Fussweg.shp", sep = "/"))
+foot_network <- st_transform(x = foot_network, crs = st_crs(zurich)) # set crs
+foot_network$PK <- 1:nrow(foot_network)
+foot_network$time_cost <- as.integer(0) # input needed for isochrones
+foot_network$incline <- as.numeric(0)
+## Multilinestring to string
+foot_network <- st_cast(x = foot_network, to = "LINESTRING")
+
+# 
+# tmap_mode("view")
+# tm_shape(zurich)+
+#   tm_polygons(col = "white")+
+#   tm_shape(population)+
+#   tm_symbols(col = "red", palette = "Pastel1", 
+#              size = "poptotal", scale = 1, 
+#              border.col = NA)+
+#   tm_shape(services)+
+#   tm_symbols(col = "blue")+
+#   tm_shape(road_network)+
+#   tm_lines(col = "black")
+```
+
+## Foot network incline
+
+Calculate the network segment inclines.
+
+Challenge! One link has a downhill and uphill version, code must recognize which one is used.
+For later...
+
+Incline formula; divide length by height difference.
+
+First, calculate segment length (haversine, or cheat?).
+
+```{r foot network inclines}
+library(sp)
+
+foot_network$delta_z <- abs(foot_network$HOEHE_ANFA - foot_network$HOEHE_ENDE)
+foot_network$length <- st_length(foot_network) %>% as.numeric()
+
+foot_network$incline <- foot_network$delta_z/foot_network$length
+```
+
+
+# Data pre-processing
+Before we can implement the 2sfca, the data has to be of an appropriate format and depth. We need to prepare the road network dataset for calculating isochrones; catchment areas reachable from a location within a given time budget and network speeds.
+
+The implementation of isochrones will be done using the cppRouting package which integrates the theories of Edger Dijkstra, who worked with and developed graph theory applications in computer science. The Dijkstra algorithm is used for routing between points on a network and is well established in transport sciences; and subsequently, very efficient. The cppRouting package integrates it with R and with some workarounds, we can implement it with spatial data.
+
+Before we can develop isochrones we cannot do the 2SFCA methodology.
+
+Furthermore, for proper isochronal analysis we need to know, for each service and demand point, what is the closest road and "snap" this point of interest to that road. 
+
+## Road network vertices
+The road network is a list of all roads with their geometry. We have to find where do the geometries interesct and declare these intersections as a vertex per the graph theory (a graph is a set of edges and vertices). We have to save in the road network the start and end vertex of a road (edge) as the index of the vertices in a separate spatial data frame. The vertices dataframe will contain the PK (the index) and the X and Y coordinate of the vertex.
+
+In our dataset, every start and end coordinate of a line is a vertex. We need to extract these, assign them a unique ID, and record which edges share them to remove duplicates.
+
+```{r Network vertices, warning=F}
+
+
+road_network$start_vertex <- st_line_sample(road_network, sample = 0) # st_line_sample with sample = 0 provides the first point of a linestring
+road_network$start_vertex <- st_cast(x = road_network$start_vertex, "POINT") # define proper spatial object class; much better to be exact than wonder why is the code not working down the line
+road_network$end_vertex <- st_line_sample(road_network, sample = 1) # st_line_sample with sample = 1 provides the last point of a linestring
+road_network$end_vertex <- st_cast(x = road_network$end_vertex, "POINT") # define proper spatial object class
+#road_network$intersects <- c(NA)
+
+x <- c(st_coordinates(road_network$end_vertex)[,1], st_coordinates(road_network$start_vertex)[,1]) 
+y <- c(st_coordinates(road_network$end_vertex)[,2], st_coordinates(road_network$start_vertex)[,2])
+
+road_vertices <- data.frame("x" = x, # get X coord of all road_vertices
+                       "y" = y, # get y coord of all road_vertices
+                       stringsAsFactors = F)
+
+road_vertices <- st_as_sf(x = road_vertices, coords = c("x", "y"), remove = F) # turn into spatial points df
+st_crs(road_vertices) <- st_crs(road_network) # regulate crs! ALWAYS TAKE NOTE OF CRS
+
+# remove duplicates
+road_vertices <- road_vertices[!duplicated(road_vertices$geometry),]
+rm(x,y)
+
+road_vertices$PK <- 1:nrow(road_vertices)
+row.names(road_vertices) <- road_vertices$PK # re-align PK and row numbers in View()
+
+
+
+
+# Relate each road with a vertex
+road_network$from <- c(NA)
+road_network$to <- c(NA)
+
+road_network$from <- st_equals(x = road_network$start_vertex, y = road_vertices$geometry) # which vertex starts the road?
+road_network$to <- st_equals(x = road_network$end_vertex, y = road_vertices$geometry) # which vertex ends the road?
+
+
+#### visual inspection####
+# tmap_mode("view")
+# 
+# tm_shape(road_network$geometry)+
+#   tm_lines(col = "black", lwd = 1)+
+#   tm_basemap(NULL)+
+#   tm_shape(road_vertices$geometry)+
+#   tm_symbols(size = 0.001, col = "red")
+
+
+```
+## Foot network vertices
+Hodas data
+
+```{r foot_network vertices, warning=F}
+
+
+foot_network$start_vertex <- st_line_sample(foot_network, sample = 0) # st_line_sample with sample = 0 provides the first point of a linestring
+foot_network$start_vertex <- st_cast(x = foot_network$start_vertex, "POINT") # define proper spatial object class; much better to be exact than wonder why is the code not working down the line
+foot_network$end_vertex <- st_line_sample(foot_network, sample = 1) # st_line_sample with sample = 1 provides the last point of a linestring
+foot_network$end_vertex <- st_cast(x = foot_network$end_vertex, "POINT") # define proper spatial object class
+#foot_network$intersects <- c(NA)
+
+x <- c(st_coordinates(foot_network$end_vertex)[,1], st_coordinates(foot_network$start_vertex)[,1]) 
+y <- c(st_coordinates(foot_network$end_vertex)[,2], st_coordinates(foot_network$start_vertex)[,2])
+
+foot_vertices <- data.frame("x" = x, # get X coord of all vertices
+                       "y" = y, # get y coord of all vertices
+                       stringsAsFactors = F)
+
+foot_vertices <- st_as_sf(x = foot_vertices, coords = c("x", "y"), remove = F) # turn into spatial points df
+st_crs(foot_vertices) <- st_crs(foot_network) # regulate crs! ALWAYS TAKE NOTE OF CRS
+
+# remove duplicates
+foot_vertices <- foot_vertices[!duplicated(foot_vertices$geometry),]
+rm(x,y)
+
+foot_vertices$PK <- 1:nrow(foot_vertices)
+row.names(foot_vertices) <- foot_vertices$PK # re-align PK and row numbers in View()
+
+
+
+
+# Relate each road with a vertex
+foot_network$from <- c(NA)
+foot_network$to <- c(NA)
+
+foot_network$from <- st_equals(x = foot_network$start_vertex, y = foot_vertices$geometry) # which vertex starts the road?
+foot_network$to <- st_equals(x = foot_network$end_vertex, y = foot_vertices$geometry) # which vertex ends the road?
+
+
+#### visual inspection####
+tmap_mode("view")
+# 
+# tm_shape(foot_network$geometry)+
+#   tm_lines(col = "black", lwd = 1)+
+#   tm_basemap(NULL)+
+#   tm_shape(foot_vertices$geometry)+
+#   tm_symbols(size = 0.001, col = "red")
+
+
+```
+
+## Snap population and service points to road network
+Now that we know the vertices of our transport network, we need to snap populations and hospitals to the nearest vertex. Alternatively (e.g. with network analyst in ARcGIS), the snapping can be done to the nearest edge. However, the cppRouting package uses vertices as the starting points for calculating isochrones.
+
+
+```{r Network position snap, warning=F, echo=F}
+
+# snap hospitals to roads
+services$road_vertex_id <- st_nearest_feature(x = services, y = road_vertices)
+services$road_network_position <- st_geometry(road_vertices)[services$road_vertex_id]
+
+
+# snap demographic data to roads
+population$road_vertex_id <- st_nearest_feature(x = population, y = road_vertices)
+population$road_network_position <- st_geometry(road_vertices)[population$road_vertex_id]
+
+
+# no snapping
+#   tm_shape(population$geometry)+
+#   tm_symbols(col = "red", palette = "Pastel1",
+#              size = 0.01,
+#              border.col = NA)+
+#   tm_legend(show = F)+
+#   tm_shape(services$geometry)+
+#   tm_symbols(col = "blue")+
+#   tm_shape(network$geometry)+
+#   tm_lines(col = "black")
+# 
+# # with snapping
+#   tm_shape(population$road_network_position)+
+#   tm_symbols(col = "red", palette = "Pastel1",
+#              size = 0.1,
+#              border.col = NA)+
+#   tm_legend(show = F)+
+#   tm_shape(services$road_network_position)+
+#   tm_symbols(col = "blue")+
+#   tm_shape(network$geometry)+
+#   tm_lines(col = "black")
+```
+
+##Snap foot network
+
+```{r foot network position snap, warning=F, echo=F}
+
+# snap hospitals to roads
+services$foot_vertex_id <- st_nearest_feature(x = services, y = foot_vertices)
+services$foot_network_position <- st_geometry(foot_vertices)[services$foot_vertex_id]
+
+
+# snap demographic data to roads
+population$foot_vertex_id <- st_nearest_feature(x = population, y = foot_vertices)
+population$foot_network_position <- st_geometry(foot_vertices)[population$foot_vertex_id]
+
+
+
+# # no snapping
+#   tm_shape(population$geometry)+
+#   tm_symbols(col = "red", palette = "Pastel1",
+#              size = 0.01,
+#              border.col = NA)+
+#   tm_legend(show = F)+
+#   tm_shape(services$geometry)+
+#   tm_symbols(col = "blue")+
+#   tm_shape(foot_network$geometry)+
+#   tm_lines(col = "black")
+# 
+# # with snapping
+#   tm_shape(population$foot_network_position)+
+#   tm_symbols(col = "red", palette = "Pastel1",
+#              size = 0.1,
+#              border.col = NA)+
+#   tm_legend(show = F)+
+#   tm_shape(services$foot_network_position)+
+#   tm_symbols(col = "blue")+
+#   tm_shape(foot_network$geometry)+
+#   tm_lines(col = "black")
+```
+
+
+
+# Derive Isochrones
+Having prepared our data for implementing isochrones, all that is left to be done is assign cost factors to roads, define network speeds (e.g. 5km/h for walking speed), and build a "network dataset"; that is, a transport network graph in this particular implementation.
+
+## Pre-isochrone input parameters
+```{r Movement speed and network costs input}
+# time budget and travel costs for the network
+movement_speed <- 5 #in km/hour
+
+
+meter_per_minute <- (movement_speed*1000)/60 # how many meters do we cross per minute with given movement speed in km/h
+road_network$time_cost <- road_network$LENGTH/meter_per_minute # how many minutes does it cost to cover the edge
+foot_network$time_cost <- foot_network$length/meter_per_minute # how many minutes does it cost to cover the edge
+
+rm(meter_per_minute)
+```
+
+## Dijkstra graphs
+Dijkstra algorithm graph. Data needs specific format to properly make graph.
+https://github.com/vlarmet/cppRouting#package-presentation
+
+
+```{r Dijkstra algorithm graph}
+# initialize network graph object
+dijkstra_roads <- road_network[,c("from", "to", "time_cost")]
+dijkstra_footpaths <- foot_network[,c("from", "to", "time_cost")]
+
+# define geometries (i.e. column)
+st_geometry(dijkstra_roads) <- NULL
+st_geometry(dijkstra_footpaths) <- NULL
+
+# coordinates of all network vertices (needed for dijkstra)
+road_coord <- road_vertices[,c("PK", "x", "y")]
+st_geometry(road_coord) <- NULL
+foot_coord <- foot_vertices[,c("PK", "x", "y")]
+st_geometry(foot_coord) <- NULL
+
+# dijkstra graphs
+road_graph <- makegraph(dijkstra_roads, directed = F, coords = road_coord) # non-directed; else algorithm looks only one direction
+foot_graph <- makegraph(dijkstra_footpaths, directed = F, coords = foot_coord) # foot network version
+```
+
+
+## Isochrone example
+Isochrones are catchment areas around points of interest which encompass all space reachable through the network at a given time budget and movement speed.
+
+Isochrones use network distances which is preferable to euclidean distances (e.g. buffers). Network distances better model spatial reality and actual reachability, and take into account natural barriers (e.g. a river).
+
+```{r Isochrone example}
+
+# road_iso <- get_isochrone(road_graph, from = "500", lim = 10, long = T) # run isochrone for vertex 1823; lim determines time budget; long = T to give dataframe
+# foot_iso <- get_isochrone(foot_graph, from = "500", lim = 10, long = T) # lim = time budget
+#
+# road_extent <- road_vertices[road_iso$node,] # get all reachable vertices from starting vertex
+# road_extent <- st_multipoint(x = cbind(st_coordinates(road_extent)[,1], st_coordinates(road_extent)[,2])) # turn into multipoint
+# foot_extent <- foot_vertices[foot_iso$node,] # get all reachable foot_vertices from starting vertex
+# foot_extent <- st_multipoint(x = cbind(st_coordinates(foot_extent)[,1], st_coordinates(foot_extent)[,2])) # turn into multipoint
+#
+# # roadnet catchment
+# road_catchment <- st_convex_hull(road_extent) # get convex hull from the multipoint feature
+# road_catchment <- st_geometry(road_catchment) # force back into sfc object
+# st_crs(road_catchment) <- st_crs(road_vertices) # manage the crs
+# # footnet version
+# foot_catchment <- st_convex_hull(foot_extent) # get convex hull from the multipoint feature
+# foot_catchment <- st_geometry(foot_catchment) # force back into sfc object
+# st_crs(foot_catchment) <- st_crs(foot_vertices) # manage the crs
+
+
+
+#### visual inspection####
+# tmap_mode("view")
+#
+# tm_shape(road_catchment)+
+#   tm_polygons(col = "red")+
+#   tm_shape(road_network$geometry)+
+#   tm_lines(col = "black", lwd = 1)+
+#   tm_basemap(NULL)+
+#   tm_shape(road_vertices$geometry)+
+#   tm_symbols(size = 0.0001, col = "blue")+
+#   tm_shape(population)+
+#   tm_symbols(size = 0.001, col = "green")+
+#   tm_shape(road_vertices$geometry[as.integer(unique(road_iso$origin))])+
+#   tm_symbols(size = 1, col = "purple")
+#
+#
+# #footnet version
+# tm_shape(foot_catchment)+
+#   tm_polygons(col = "red")+
+#   tm_shape(foot_network$geometry)+
+#   tm_lines(col = "black", lwd = 1)+
+#   tm_basemap(NULL)+
+#   tm_shape(foot_vertices$geometry)+
+#   tm_symbols(size = 0.0001, col = "blue")+
+#   tm_shape(population)+
+#   tm_symbols(size = 0.001, col = "green")+
+#   tm_shape(foot_vertices$geometry[as.integer(unique(foot_iso$origin))])+
+#   tm_symbols(size = 1, col = "purple")
+
+```
+
+## Data frame for storing results
+We will create a dataframe for storing the results of the 2SFCA analysis.
+```{r Results dataframe}
+road_results_2sfca_services <- data.frame("location_id" = c(NA), # row id of the location in its perspective dataframe
+                                         "catchment_poly" = c(NA), # the geometry of the isochrone catchment
+                                         "road_vertex_id" = c(NA), # the id of the snapped to vertex
+                                         "time_budget" = c(NA), # the time budget of the isochrone analysis
+                                         stringsAsFactors = F)[1:nrow(services),] # populate rows
+
+road_results_2sfca_population <- data.frame("location_id" = c(NA), 
+                                           "catchment_poly" = c(NA),
+                                           "road_vertex_id" = c(NA),
+                                           "time_budget" = c(NA),
+                                           stringsAsFactors = F)[1:nrow(population),]
+
+
+#footnet ver
+foot_results_2sfca_services <- data.frame("location_id" = c(NA), # row id of the location in its perspective dataframe
+                                         "catchment_poly" = c(NA), # the geometry of the isochrone catchment
+                                         "foot_vertex_id" = c(NA), # the id of the snapped to vertex
+                                         "time_budget" = c(NA), # the time budget of the isochrone analysis
+                                         stringsAsFactors = F)[1:nrow(services),] # populate rows
+
+foot_results_2sfca_population <- data.frame("location_id" = c(NA), 
+                                           "catchment_poly" = c(NA),
+                                           "foot_vertex_id" = c(NA),
+                                           "time_budget" = c(NA),
+                                           stringsAsFactors = F)[1:nrow(population),]
+```
+
+
+### Fac/pop isochrones roadnet
+Now that we have the road position of every point of interest, we can create isochrones for that location.
+```{r Isochrone analysis, echo = F}
+time_budget <- 10 # in minutes
+
+# hospital isochrones
+for(i in 1:nrow(services)) {
+  
+  road_iso <- get_isochrone(road_graph, # run isochrone for hospitals based on road graph
+                            from = services$road_vertex_id[i], # starting points
+                            lim = time_budget, long = T)  # time budget
+  
+  # calculate the road_extent of the isochrone
+  road_extent <- road_vertices[road_iso$node,] # isochrones input
+  road_extent <- st_multipoint(x = cbind(st_coordinates(road_extent)[,1], st_coordinates(road_extent)[,2]))
+  
+  # derive a catchment area from isochrone road_extent
+  road_catchment <- st_convex_hull(road_extent) # get convex hull from extentable road_vertices
+  road_catchment <- st_geometry(road_catchment) # force back into sfc object
+  st_crs(road_catchment) <- st_crs(road_vertices)
+  
+  # save results
+  road_results_2sfca_services$location_id[i] <- i
+  road_results_2sfca_services$road_vertex_id[i] <- services$road_vertex_id[i]
+  road_results_2sfca_services$time_budget[i] <- time_budget
+  road_results_2sfca_services$catchment_poly[i] <- road_catchment
+}
+
+# population isochrones
+for(i in 1:nrow(population)) {
+  
+  road_iso <- get_isochrone(road_graph,
+                            from = population$road_vertex_id[i],
+                            lim =time_budget, long = T) # run isochrone for hospitals
+  
+  # calculate the road_extent of the isochrone
+  road_extent <- road_vertices[road_iso$node,]
+  road_extent <- st_multipoint(x = cbind(st_coordinates(road_extent)[,1], st_coordinates(road_extent)[,2]))
+  
+  # derive a catchment area from isochrone road_extent
+  road_catchment <- st_convex_hull(road_extent) # get convex hull from extentable road_vertices
+  road_catchment <- st_geometry(road_catchment) # force back into sfc object
+  st_crs(road_catchment) <- st_crs(road_vertices)
+  
+  # save results
+  road_results_2sfca_population$location_id[i] <- i
+  road_results_2sfca_population$road_vertex_id[i] <- population$road_vertex_id[i] # the id of the vertex assigned to the point; based on the road/foot vertices dataframe
+  road_results_2sfca_population$time_budget[i] <- time_budget
+  road_results_2sfca_population$catchment_poly[i] <- road_catchment
+  
+  if(i %in% seq(0,50000,by = 500)){print(i)}
+  
+}
+```
+### Fac/pop isochrones footnet
+
+
+```{r footnet isochrones, echo = F}
+time_budget <- 10 # in minutes
+
+# hospital isochrones
+for(i in 1:nrow(services)) {
+  
+  #graph part
+  foot_iso <- get_isochrone(foot_graph, 
+                            from = services$foot_vertex_id[i],
+                            lim = time_budget, long = T) # run isochrone for hospitals
+  
+  # calculate the extent_foot of the isochrone
+  foot_extent <- foot_vertices[foot_iso$node,]
+  foot_extent <- st_multipoint(x = cbind(st_coordinates(foot_extent)[,1], st_coordinates(foot_extent)[,2]))
+  
+  # derive a foot_catchment area from isochrone extent
+  foot_catchment <- st_convex_hull(foot_extent) # get convex hull from extentable vertices
+  foot_catchment <- st_geometry(foot_catchment) # force back into sfc object
+  st_crs(foot_catchment) <- st_crs(foot_vertices)
+  
+  # save results
+  foot_results_2sfca_services$location_id[i] <- i
+  foot_results_2sfca_services$foot_vertex_id[i] <- services$foot_vertex_id[i]
+  foot_results_2sfca_services$time_budget[i] <- time_budget
+  foot_results_2sfca_services$catchment_poly[i] <- foot_catchment
+}
+
+# population isochrones
+
+for(i in 1:nrow(population)) {#nrow(population)
+  
+  foot_iso <- get_isochrone(foot_graph,
+                            from = population$foot_vertex_id[i],
+                            lim =time_budget, long = T) # run isochrone for hospitals
+  
+  # calculate the extent_foot of the isochrone
+  foot_extent <- foot_vertices[foot_iso$node,]
+  foot_extent <- st_multipoint(x = cbind(st_coordinates(foot_extent)[,1], st_coordinates(foot_extent)[,2]))
+  
+  # derive a foot_catchment area from isochrone extent
+  foot_catchment <- st_convex_hull(foot_extent) # get convex hull from extentable foot_vertices
+  foot_catchment <- st_geometry(foot_catchment) # force back into sfc object
+  st_crs(foot_catchment) <- st_crs(foot_vertices)
+  
+  # save results
+  foot_results_2sfca_population$location_id[i] <- i
+  foot_results_2sfca_population$foot_vertex_id[i] <- population$foot_vertex_id[i]
+  foot_results_2sfca_population$time_budget[i] <- time_budget
+  foot_results_2sfca_population$catchment_poly[i] <- foot_catchment
+  
+  if(i %in% seq(0,50000,by = 500)){print(i)}
+  
+}
+```
+
+# 2SFCA analysis
+
+Finally, we arrive to the reason why we are all here. 2SFCA implementation.
+
+The preparatory steps are indespensible however, no matter the platform for implementation.
+
+## 2SFCA - Step 1: Healthcare supply and demand at hospitals
+We will calculate the supply-demand ratio at every hospital by dividing the a "supply capacity" with the total serviced population.
+
+We will assume a per-doctor capacity of 24 patients in a day; and assign each hospital the arbitrary total of a 100 doctors. This data should ofcourse be informed and depending on your research can (and should) go into much detail; e.g. accessibility to dialysis, oncologists, respirators (Covid-19), etc. 
+
+Therefore, the daily healthcare supply is 2400 people per hospital.
+
+
+```{r 2SFCA Step 1}
+people_per_doctor <- 24
+doctors_per_hospital <- 100
+capacity <- people_per_doctor*doctors_per_hospital # healthcare supply at a hospital
+
+services$road_supply_demand_ratio <- as.numeric(0)
+services$foot_supply_demand_ratio <- as.numeric(0)
+
+road_results_2sfca_services$population_serviced <- c(NA) # record total population serviced by a hospital
+road_results_2sfca_services$capacity <- capacity
+road_results_2sfca_services$supply_demand_ratio <- c(NA) # supply-demand ratio
+
+foot_results_2sfca_services$population_serviced <- c(NA) # record total population serviced by a hospital
+foot_results_2sfca_services$capacity <- capacity
+foot_results_2sfca_services$supply_demand_ratio <- c(NA) # supply-demand ratio
+
+# road catchment analysis
+for (i in 1:nrow(services)) {
+  
+  
+  catchment <- road_results_2sfca_services$catchment_poly[[i]] # retrieve the geometry of the isochrone
+  
+  # supply-demand ratio calculation
+  population_serviced <- st_intersects(population$geometry, catchment, sparse = F) #total pop in hospital catchment
+  population_serviced <- sum(population$poptotal[population_serviced])
+  supply_demand_ratio <- capacity/population_serviced
+  
+  # save results
+  road_results_2sfca_services$supply_demand_ratio[i] <- supply_demand_ratio
+  road_results_2sfca_services$population_serviced[i] <- population_serviced
+  services$road_supply_demand_ratio[i] <- road_results_2sfca_services$supply_demand_ratio[i]
+  
+  
+}
+
+# foot catchment analysis
+for (i in 1:nrow(services)) {
+  
+  
+  catchment <- foot_results_2sfca_services$catchment_poly[[i]] # retrieve the geometry of the isochrone
+  
+  # supply-demand ratio calculation
+  population_serviced <- st_intersects(population$geometry, catchment, sparse = F) #total pop in hospital catchment
+  population_serviced <- sum(population$poptotal[population_serviced])
+  supply_demand_ratio <- capacity/population_serviced
+  
+  # save results
+  foot_results_2sfca_services$supply_demand_ratio[i] <- supply_demand_ratio
+  foot_results_2sfca_services$population_serviced[i] <- population_serviced
+  services$foot_supply_demand_ratio[i] <- foot_results_2sfca_services$supply_demand_ratio[i]
+  
+  
+}
+```
+
+## 2SFCA - Step 2: Population accessibility to healthcare
+
+Having calculated the supply-demand ratios at hospitals, we will find out what is the 2SFCA spatio-temporal accessibility score at each population point.
+
+This is the second step of the 2fa and includes finding out which hospitals are reachable from every population point, and then summing up the supply-demand ratios of reachable hospitals.
+
+What we get is an accessibility score which represents how much healthcare capacity is accessible to a person living in a certain population point. Some population points might have no hospitals reachable in the given time budget! The 2SFCA score will be 0 in that case.
+
+
+
+```{r 2SFCA Step 2}
+road_results_2sfca_population$accessibility_score <- c(NA) # 2sfca spatio-temporal accessibility score
+road_results_2sfca_population$reachable_hospitals <- c(NA) # index of reachable hospitals
+road_results_2sfca_population$poptotal <- c(NA) # total population at population point
+
+foot_results_2sfca_population$accessibility_score <- c(NA) # 2sfca spatio-temporal accessibility score
+foot_results_2sfca_population$reachable_hospitals <- c(NA) # index of reachable hospitals
+foot_results_2sfca_population$poptotal <- c(NA) # total population at population point
+
+# road net
+for (i in 1:nrow(population)) {
+  
+  catchment <- road_results_2sfca_population$catchment_poly[[i]] # retrieve the geometry of the isochrone
+  
+  # reachable hospitals
+  reachable_hospitals <- st_intersects(services$geometry, catchment, sparse = F) #total pop in hospital catchment
+  road_results_2sfca_population$reachable_hospitals[i] <- list(which(reachable_hospitals==T)) # record the index of the hospitals
+  
+  # accessibility_score - sum of supply-demand ratios at reachable hospitals
+  accessibility_score <- sum(road_results_2sfca_services[which(reachable_hospitals==T), "supply_demand_ratio"])
+  
+  # save results
+  road_results_2sfca_population$accessibility_score[i] <- accessibility_score
+  road_results_2sfca_population$poptotal[i] <- population$poptotal[i]
+
+  
+    if(i %in% seq(0,5000,by = 500)){print(i)} # just to keep track of progress
+}
+
+
+# foot net
+for (i in 1:nrow(population)) {
+  
+  catchment <- foot_results_2sfca_population$catchment_poly[[i]] # retrieve the geometry of the isochrone
+  
+  # reachable hospitals
+  reachable_hospitals <- st_intersects(services$geometry, catchment, sparse = F) #total pop in hospital catchment
+  foot_results_2sfca_population$reachable_hospitals[i] <- list(which(reachable_hospitals==T)) # record the index of the hospitals
+  
+  # accessibility_score - sum of supply-demand ratios at reachable hospitals
+  accessibility_score <- sum(foot_results_2sfca_services[which(reachable_hospitals==T), "supply_demand_ratio"])
+  
+  # save results
+  foot_results_2sfca_population$accessibility_score[i] <- accessibility_score
+  foot_results_2sfca_population$poptotal[i] <- population$poptotal[i]
+
+  
+    if(i %in% seq(0,5000,by = 500)){print(i)} # just to keep track of progress
+}
+
+```
+
+
+# Results interpretation
+We successfully implemented the 2SFCA methodology in R and derived accessibility scores for each population point.
+
+WE saved these scores in a dataframe which can be related to the original population dataset through primary keys. What we are interested in now is the spatial variation in accessibility scores, as well as overall scores for the city of Zurich.
+
+```{r Overall 2sfca scores}
+print("2SFCA scores at population points foot")
+summary(foot_results_2sfca_population$accessibility_score)
+print("Supply-demand ratios at hospitals foot")
+summary(foot_results_2sfca_services$supply_demand_ratio)
+print("2SFCA scores at population points road")
+summary(road_results_2sfca_population$accessibility_score)
+print("Supply-demand ratios at hospitals road")
+summary(road_results_2sfca_population$supply_demand_ratio)
+
+population$foot_accessibility_score <- foot_results_2sfca_population$accessibility_score
+population$road_accessibility_score <- road_results_2sfca_population$accessibility_score
+```
+
+
+
