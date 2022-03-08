@@ -1,0 +1,6 @@
+﻿Sie haben folgende Bestellung aufgegeben: 
+Name des Geodatensatzes: Spital 
+Name des Ausschnittes: stzh
+Ausschnitt (falls definiert): 2676224.694, 1241584.105, 2689665.812,1254306.233 
+Zeitpunkt der Bearbeitung: 07.10.2020 - 00:24 
+
